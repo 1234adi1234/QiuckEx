@@ -63,6 +63,7 @@ import { DashboardFeedModule } from "./dashboard-feed/dashboard-feed.module";
 import { OutboxModule } from "./events/outbox/outbox.module";
 import { DeploymentSyncModule } from "./deployment-sync/deployment-sync.module";
 import { ManifestsModule } from "./manifests/manifests.module";
+import { ReceiptsModule } from "./receipts/receipts.module";
 
 type AppImport =
 | Type<unknown>
@@ -118,6 +119,7 @@ OperationsModule,
     OutboxModule,
     DeploymentSyncModule,
     ManifestsModule,
+    ReceiptsModule,
     ];
 
     try {
