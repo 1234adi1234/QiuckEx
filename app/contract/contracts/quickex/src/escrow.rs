@@ -3,12 +3,16 @@
 //! # State Machine
 //!
 //! ```text
-//! [*] --> Pending  : deposit() / deposit_with_commitment()
+//! [*] --> Pending  : deposit() / deposit_with_commitment() / deposit_multi_sig()
 //! Pending --> Spent    : withdraw(proof)  [current_time < expires_at OR no expiry]
 //! Pending --> Refunded : refund(owner)    [current_time >= expires_at]
 //! Pending --> Disputed : dispute()        [any participant can call]
 //! Disputed --> Spent   : resolve_dispute() [arbiter decides for recipient]
 //! Disputed --> Refunded: resolve_dispute() [arbiter decides for owner]
+//!
+//! Multi-sig escrow (created by deposit_multi_sig, arbiter_threshold > 0):
+//! Disputed --> Spent/Refunded: resolve_dispute_multi_sig()  [fresh votes >= quorum]
+//! Disputed --> Refunded: resolve_dispute_timeout()         [deadline passed, quorum missed]
 //! ```
 //!
 //! # Time-lock Invariants
@@ -40,6 +44,12 @@
 //!   Once status is `Spent` or `Refunded`, no further state transitions are
 //!   permitted. All entry points check this before any other logic.
 //!
+//! **INV-6 (Multi-sig is quorum-only):**
+//!   An escrow with `arbiter_threshold > 0` can only leave `Disputed` through
+//!   `resolve_dispute_multi_sig` or `resolve_dispute_timeout`. `resolve_dispute`
+//!   refuses it even for a caller holding the global `Arbiter` role, so no
+//!   single address can settle a dispute the depositor required a quorum for.
+//!
 //! ## Asset Type Handling
 //!
 //! This module supports both Native XLM and Stellar Asset Contract (SAC) tokens:
@@ -57,8 +67,10 @@
 //! - `refund` fails with [`EscrowNotExpired`] if `expires_at == 0` or `now < expires_at`.
 //! - Both fail with [`AlreadySpent`] if status is not `Pending`.
 //! - `refund` fails with [`InvalidOwner`] if caller ≠ `entry.owner`.
-//! - `dispute` requires an assigned arbiter and `Pending` status.
-//! - `resolve_dispute` can only be called by the assigned arbiter.
+//! - `dispute` requires an assigned arbitration authority: a single `arbiter`,
+//!   or a non-empty `arbiters` set in multi-sig mode (`arbiter_threshold > 0`).
+//! - `resolve_dispute` can only be called by the assigned arbiter, and never
+//!   for a multi-sig escrow (INV-6).
 
 use soroban_sdk::{token, Address, Bytes, BytesN, Env, Vec};
 
@@ -130,6 +142,52 @@ fn compute_expires_at(env: &Env, timeout_secs: u64) -> Result<u64, QuickexError>
 // deposit
 // ---------------------------------------------------------------------------
 
+/// Shared tail for every deposit variant: write the entry, pull the funds,
+/// emit `EscrowDeposited`, and fire the `Create` hook.
+///
+/// All four deposit entrypoints funnel through here so the storage write,
+/// the token transfer, the event payload, and the hook call can never drift
+/// apart between the single-arbiter and multi-sig paths.
+///
+/// `transfer_amount` is the amount actually pulled from `owner` (the initial
+/// payment for a partially funded escrow); `entry.amount_due` and
+/// `entry.amount_paid` carry the amounts the event reports.
+fn commit_new_escrow(
+    env: &Env,
+    entry: EscrowEntry,
+    commitment: &BytesN<32>,
+    owner: Address,
+    transfer_amount: i128,
+) {
+    let token_address = entry.token.clone();
+    let commitment_bytes: Bytes = commitment.clone().into();
+
+    put_escrow(env, &commitment_bytes, &entry);
+
+    let token_client = token::Client::new(env, &token_address);
+    token_client.transfer(&owner, env.current_contract_address(), &transfer_amount);
+
+    events::publish_escrow_deposited(
+        env,
+        commitment.clone(),
+        owner.clone(),
+        token_address.clone(),
+        entry.amount_due,
+        entry.amount_paid,
+        entry.expires_at,
+    );
+
+    hook::invoke_hooks(
+        env,
+        HookEventKind::Create,
+        commitment,
+        owner,
+        token_address,
+        transfer_amount,
+        0,
+    );
+}
+
 /// Deposit funds and create an escrow entry keyed by `SHA256(owner || amount_due || salt)`.
 ///
 /// - Transfers `amount` from `owner` to the contract.
@@ -178,9 +236,6 @@ pub fn deposit(
         commitment::amount_commitment_hashes(env, &owner, amount, &salt)?;
     let now = env.ledger().timestamp();
 
-    // optimized: build client first (borrows token), then move token into entry
-    // commitment converted to Bytes once, reused
-    let token_client = token::Client::new(env, &token);
     let commitment_bytes: Bytes = commitment.clone().into();
     if has_escrow(env, &commitment_bytes) {
         return Err(QuickexError::CommitmentAlreadyExists);
@@ -204,30 +259,8 @@ pub fn deposit(
         arbiter_threshold: 0,
     };
 
-    put_escrow(env, &commitment_bytes, &entry);
     put_escrow_id_mapping(env, &escrow_id, &commitment);
-    token_client.transfer(&owner, env.current_contract_address(), &amount);
-
-    let token_address = token_client.address.clone();
-    events::publish_escrow_deposited(
-        env,
-        commitment.clone(),
-        owner.clone(),
-        token_address.clone(),
-        amount,
-        amount,
-        expires_at,
-    );
-
-    hook::invoke_hooks(
-        env,
-        HookEventKind::Create,
-        &commitment,
-        owner,
-        token_address,
-        amount,
-        0,
-    );
+    commit_new_escrow(env, entry, &commitment, owner, amount);
 
     Ok(commitment)
 }
@@ -281,17 +314,13 @@ pub fn deposit_with_commitment(
         return Err(QuickexError::CommitmentAlreadyExists);
     }
 
-    let token_client = token::Client::new(env, &token);
-    token_client.transfer(&from, env.current_contract_address(), &amount);
-
     let now = env.ledger().timestamp();
 
-    let from_ref = from.clone();
     let entry = EscrowEntry {
         token, // moved
         amount_due: amount,
         amount_paid: amount, // Initial payment is the full amount
-        owner: from,         // moved
+        owner: from.clone(),
         status: EscrowStatus::Pending,
         created_at: now,
         expires_at,
@@ -300,27 +329,7 @@ pub fn deposit_with_commitment(
         arbiter_threshold: 0,
     };
 
-    put_escrow(env, &commitment_bytes, &entry);
-    let token_addr = token_client.address.clone();
-    events::publish_escrow_deposited(
-        env,
-        commitment.clone(),
-        from_ref.clone(),
-        token_addr.clone(),
-        amount,
-        amount,
-        expires_at,
-    );
-
-    hook::invoke_hooks(
-        env,
-        HookEventKind::Create,
-        &commitment,
-        from_ref,
-        token_addr,
-        amount,
-        0,
-    );
+    commit_new_escrow(env, entry, &commitment, from, amount);
 
     Ok(())
 }
@@ -381,8 +390,6 @@ pub fn deposit_partial(
     let commitment = commitment::create_amount_commitment(env, owner.clone(), amount_due, salt)?;
     let now = env.ledger().timestamp();
 
-    let token_client = token::Client::new(env, &token);
-    let commitment_bytes: Bytes = commitment.clone().into();
     let entry = EscrowEntry {
         token, // moved
         amount_due,
@@ -396,29 +403,133 @@ pub fn deposit_partial(
         arbiter_threshold: 0,
     };
 
-    put_escrow(env, &commitment_bytes, &entry);
-    token_client.transfer(&owner, env.current_contract_address(), &initial_payment);
+    commit_new_escrow(env, entry, &commitment, owner, initial_payment);
 
-    let token_addr = token_client.address.clone();
-    events::publish_escrow_deposited(
+    Ok(commitment)
+}
+
+// ---------------------------------------------------------------------------
+// deposit_multi_sig
+// ---------------------------------------------------------------------------
+
+/// Deposit funds and create an escrow arbitrated by a set of arbiters
+/// (M-of-N), the only entrypoint that puts an escrow into multi-sig mode.
+///
+/// - Transfers `amount` from `owner` to the contract and stores the escrow
+///   under the same amount commitment as [`deposit`].
+/// - Sets `arbiter_threshold = arbiter_threshold` and `arbiters = arbiters`;
+///   the legacy single `arbiter` field stays `None`, because in multi-sig
+///   mode the threshold — not one named address — is the authority.
+/// - If `timeout_secs > 0`, the escrow expires `timeout_secs` seconds after
+///   creation. Pass `0` for a non-expiring escrow.
+///
+/// Multi-sig mode is what makes [`vote_for_dispute`],
+/// [`resolve_dispute_multi_sig`], and [`resolve_dispute_timeout`] reachable:
+/// they all require `arbiter_threshold > 0`, and this is the only path that
+/// can set it.
+///
+/// # Arbiter-set validation
+///
+/// [`dispute_quorum::validate_arbiter_set`] runs before any state is written
+/// and rejects an empty or oversized set, a threshold outside
+/// `1..=arbiters.len()`, and duplicate addresses (a duplicate would let one
+/// arbiter's single vote be counted twice and meet the quorum alone). All of
+/// those surface as [`QuorumOutOfBounds`].
+///
+/// # Idempotency
+///
+/// Like [`deposit`], a repeated request returns the existing commitment
+/// instead of erroring. The deterministic escrow id binds the arbiter set and
+/// threshold ([`escrow_id::derive_multi_sig_escrow_id`]), so a request that
+/// names *different* arbiters is a different escrow rather than a silent
+/// re-submission of the earlier one.
+///
+/// # Errors
+/// - [`InvalidAmount`] – amount ≤ 0.
+/// - [`InvalidSalt`] – salt > 1024 bytes.
+/// - [`QuorumOutOfBounds`] – arbiter set or threshold violates the bounds above.
+/// - [`CommitmentAlreadyExists`] – an escrow already exists for this commitment.
+#[allow(clippy::too_many_arguments)]
+pub fn deposit_multi_sig(
+    env: &Env,
+    token: Address,
+    amount: i128,
+    owner: Address,
+    salt: Bytes,
+    timeout_secs: u64,
+    arbiters: Vec<Address>,
+    arbiter_threshold: u32,
+    nonce_val: u64,
+    valid_until: u64,
+) -> Result<BytesN<32>, QuickexError> {
+    if amount <= 0 {
+        return Err(QuickexError::InvalidAmount);
+    }
+
+    // Reject a malformed arbiter set before spending a nonce or touching the
+    // token balance, so a bad call can never leave a half-created escrow.
+    dispute_quorum::validate_arbiter_set(&arbiters, arbiter_threshold)?;
+
+    owner.require_auth();
+
+    nonce::verify_and_consume(
         env,
-        commitment.clone(),
-        owner.clone(),
-        token_addr.clone(),
-        amount_due,
-        initial_payment,
+        &owner,
+        nonce_val,
+        valid_until,
+        ActionType::DepositMultiSig,
+    )?;
+
+    // INV-3: validated, overflow-safe expiry computation
+    let expires_at = compute_expires_at(env, timeout_secs)?;
+
+    // Issue #304: deterministic escrow id over the full creation payload,
+    // including the arbiter set — otherwise a re-submission with different
+    // arbiters would resolve to the earlier escrow's commitment.
+    let escrow_id = escrow_id::derive_multi_sig_escrow_id(
+        env,
+        &token,
+        amount,
+        &owner,
+        &salt,
+        timeout_secs,
+        &arbiters,
+        arbiter_threshold,
+    )?;
+    if let Some(existing) = get_escrow_id_mapping(env, &escrow_id) {
+        return Ok(existing);
+    }
+
+    let (commitment, legacy_commitment) =
+        commitment::amount_commitment_hashes(env, &owner, amount, &salt)?;
+    let commitment_bytes: Bytes = commitment.clone().into();
+    if has_escrow(env, &commitment_bytes) {
+        return Err(QuickexError::CommitmentAlreadyExists);
+    }
+    if legacy_commitment != commitment {
+        let legacy_commitment_bytes: Bytes = legacy_commitment.into();
+        if has_escrow(env, &legacy_commitment_bytes) {
+            return Err(QuickexError::CommitmentAlreadyExists);
+        }
+    }
+
+    let now = env.ledger().timestamp();
+    let entry = EscrowEntry {
+        token, // moved
+        amount_due: amount,
+        amount_paid: amount,
+        owner: owner.clone(),
+        status: EscrowStatus::Pending,
+        created_at: now,
         expires_at,
-    );
+        // Multi-sig authority lives in `arbiters` + `arbiter_threshold`.
+        arbiter: None,
+        arbiters,
+        arbiter_threshold,
+    };
 
-    hook::invoke_hooks(
-        env,
-        HookEventKind::Create,
-        &commitment,
-        owner,
-        token_addr,
-        initial_payment,
-        0,
-    );
+    put_escrow_id_mapping(env, &escrow_id, &commitment);
+    commit_new_escrow(env, entry, &commitment, owner, amount);
 
     Ok(commitment)
 }
@@ -842,13 +953,18 @@ pub fn cleanup_escrow(env: &Env, commitment: BytesN<32>) -> Result<(), QuickexEr
 /// Initiate a dispute for a pending escrow, locking the funds.
 ///
 /// - Any participant can call this function.
-/// - Requires an assigned arbiter.
+/// - Requires an arbitration authority: a single `arbiter`, or — in multi-sig
+///   mode — a non-empty `arbiters` set. Escrows created by
+///   [`deposit_multi_sig`] carry only the latter.
 /// - Escrow must be in `Pending` status.
 /// - Changes status to `Disputed`, locking funds until resolution(INV4)
 /// - In multi-sig mode (`arbiter_threshold > 0`), freezes a
 ///   [`dispute_quorum::DisputeQuorumSnapshot`] from the *current* admin
 ///   quorum policy (Issue #865 / SC-W8-04). Later changes to that policy
-///   never affect this dispute.
+///   never affect this dispute. Single-arbiter disputes keep emitting
+///   [`events::EscrowDisputedEvent`]; multi-sig disputes emit
+///   [`events::MultiSigEscrowDisputedEvent`], which carries the whole set
+///   instead of one address.
 ///
 /// # Errors
 /// - [`CommitmentNotFound`] – no escrow for the given commitment.
@@ -860,29 +976,51 @@ pub fn dispute(env: &Env, commitment: BytesN<32>) -> Result<(), QuickexError> {
     let entry: EscrowEntry =
         get_escrow(env, &commitment_bytes).ok_or(QuickexError::CommitmentNotFound)?;
 
-    // Guard: must have an arbiter assigned
-    let arbiter = entry.arbiter.as_ref().ok_or(QuickexError::NoArbiter)?;
+    // Guard: the escrow must name an arbitration authority. `arbiter_threshold
+    // > 0` is the mode switch, so a multi-sig escrow is authorized by
+    // `arbiters` and a single-arbiter escrow by `arbiter`. An escrow carrying
+    // neither can never be resolved and must not be disputable.
+    let multi_sig = entry.arbiter_threshold > 0;
+    let single_arbiter: Option<Address> = entry.arbiter.clone();
+    if multi_sig {
+        if entry.arbiters.is_empty() {
+            return Err(QuickexError::NoArbiter);
+        }
+    } else if single_arbiter.is_none() {
+        return Err(QuickexError::NoArbiter);
+    }
 
     // Guard: escrow must be in Pending state
     if entry.status != EscrowStatus::Pending {
         return Err(QuickexError::InvalidDisputeState);
     }
 
-    // Guard: a multi-sig escrow must actually have arbiters to vote.
-    if entry.arbiter_threshold > 0 && entry.arbiters.is_empty() {
-        return Err(QuickexError::NoArbiter);
-    }
-
     let mut updated = entry.clone();
     updated.status = EscrowStatus::Disputed;
     put_escrow(env, &commitment_bytes, &updated);
 
-    if entry.arbiter_threshold > 0 {
-        let disputed_at = env.ledger().timestamp();
-        dispute_quorum::open_snapshot(env, &commitment_bytes, disputed_at, entry.arbiters.len());
+    match (multi_sig, single_arbiter) {
+        // Freeze the quorum requirement from the live policy so later admin
+        // changes cannot alter this dispute (Issue #865 / SC-W8-04).
+        (true, _) => {
+            let disputed_at = env.ledger().timestamp();
+            dispute_quorum::open_snapshot(
+                env,
+                &commitment_bytes,
+                disputed_at,
+                entry.arbiters.len(),
+            );
+            events::publish_multi_sig_escrow_disputed(
+                env,
+                commitment,
+                entry.arbiters,
+                entry.arbiter_threshold,
+            );
+        }
+        (false, Some(arbiter)) => events::publish_escrow_disputed(env, commitment, arbiter),
+        // Unreachable: the guard above already returned `NoArbiter`.
+        (false, None) => return Err(QuickexError::NoArbiter),
     }
-
-    events::publish_escrow_disputed(env, commitment, arbiter.clone());
 
     Ok(())
 }
@@ -896,6 +1034,11 @@ pub fn dispute(env: &Env, commitment: BytesN<32>) -> Result<(), QuickexError> {
 /// - Only callable by the assigned arbiter (or a globally authorized Arbiter role).
 /// - Escrow must be in `Disputed` status (INV4).
 /// - Arbiter decides whether funds go to owner (refund) or recipient (spend).
+/// - Refuses multi-sig escrows (`arbiter_threshold > 0`) outright, including
+///   for a global Arbiter: those are resolved by quorum through
+///   [`resolve_dispute_multi_sig`] (or [`resolve_dispute_timeout`]), so
+///   honouring a single-caller resolution here would let one address bypass
+///   the M-of-N requirement the depositor configured.
 ///
 /// # Arguments
 /// - `commitment`: The escrow commitment hash
@@ -905,7 +1048,8 @@ pub fn dispute(env: &Env, commitment: BytesN<32>) -> Result<(), QuickexError> {
 /// # Errors
 /// - [`CommitmentNotFound`] – no escrow for the given commitment.
 /// - [`NotArbiter`] – caller is not the assigned arbiter.
-/// - [`InvalidDisputeState`] – escrow is not in `Disputed` status.
+/// - [`InvalidDisputeState`] – escrow is not in `Disputed` status, or the
+///   escrow is in multi-sig mode and must be resolved by quorum.
 pub fn resolve_dispute(
     env: &Env,
     caller: Address,
@@ -918,6 +1062,14 @@ pub fn resolve_dispute(
     let commitment_bytes: Bytes = commitment.clone().into();
     let entry: EscrowEntry =
         get_escrow(env, &commitment_bytes).ok_or(QuickexError::CommitmentNotFound)?;
+
+    // Guard: a multi-sig escrow is only ever resolved by quorum. Checked
+    // before `require_auth`/nonce consumption so a doomed call fails fast
+    // without burning the caller's nonce, and so the mode check cannot be
+    // ordered behind the global-Arbiter bypass below.
+    if entry.arbiter_threshold > 0 {
+        return Err(QuickexError::InvalidDisputeState);
+    }
 
     // Guard: caller must be either the assigned arbiter OR have the global Arbiter role.
     caller.require_auth();
