@@ -104,6 +104,13 @@ pub enum ActionType {
     StealthWithdraw,
     SetPrivacy,
     Upgrade,
+    /// Multi-sig deposit (`lib.rs::deposit_multi_sig`).
+    ///
+    /// Appended last on purpose: the enum's XDR discriminants are part of the
+    /// persistent `NonceKey::Used(signer, nonce, action)` key, so inserting a
+    /// variant anywhere else would silently re-map nonces that were already
+    /// consumed under the old numbering and re-open their replay window.
+    DepositMultiSig,
 }
 
 impl ActionType {
@@ -124,6 +131,7 @@ impl ActionType {
             ActionType::StealthWithdraw => b"STEALTH_WITHDRAW",
             ActionType::SetPrivacy => b"SET_PRIVACY",
             ActionType::Upgrade => b"UPGRADE",
+            ActionType::DepositMultiSig => b"DEPOSIT_MULTI_SIG",
         }
     }
 }
