@@ -5,14 +5,13 @@
  * (cookies, JWT, or admin API keys) for protected /admin/* routes and API calls.
  */
 
-import { cookies } from "next/headers";
-
 /**
  * Reads admin credential from server-side cookies or environment variables.
  */
-export function getAdminCredentialServer(): string | null {
+export async function getAdminCredentialServer(): Promise<string | null> {
   try {
-    const cookieStore = cookies();
+    const { cookies } = await import("next/headers");
+    const cookieStore = await cookies();
     const token =
       cookieStore.get("admin_token")?.value ??
       cookieStore.get("quickex.adminSession")?.value ??
@@ -39,7 +38,7 @@ export function getAdminCredentialServer(): string | null {
  */
 export function getAdminCredentialClient(): string | null {
   if (typeof window === "undefined") {
-    return getAdminCredentialServer();
+    return null;
   }
 
   try {
@@ -68,10 +67,10 @@ export function getAdminCredentialClient(): string | null {
 /**
  * Determines whether the current user has a valid admin session or credential.
  */
-export function checkIsAdmin(): boolean {
+export async function checkIsAdmin(): Promise<boolean> {
   const credential =
     typeof window === "undefined"
-      ? getAdminCredentialServer()
+      ? await getAdminCredentialServer()
       : getAdminCredentialClient();
 
   if (!credential) return false;

@@ -2,8 +2,8 @@ import { redirect } from "next/navigation";
 import { ReactNode } from "react";
 import { checkIsAdmin } from "@/lib/admin-auth";
 
-export default function AdminLayout({ children }: { children: ReactNode }) {
-  if (!checkIsAdmin()) {
+export default async function AdminLayout({ children }: { children: ReactNode }) {
+  if (!(await checkIsAdmin())) {
     redirect("/"); // Admin routes are inaccessible to non-admin users
   }
 
