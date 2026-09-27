@@ -712,6 +712,12 @@ impl QuickexContract {
         nonce: u64,
         valid_until: u64,
     ) -> Result<(), QuickexError> {
+        // Route through the shared pause/emergency gate first, exactly as the
+        // other dispute entrypoints do. `EntryPoint::ResolveDispute` is not
+        // emergency-safe, so this refuses single-arbiter resolution while an
+        // emergency halt is active — the gap reported in #1004. The explicit
+        // `is_paused` block below still runs for the audit event it emits.
+        pause_policy::require_entry_allowed(&env, EntryPoint::ResolveDispute)?;
         if admin::is_paused(&env) {
             let reason = storage::get_global_pause_reason(&env);
             events::publish_pause_enforced(
