@@ -35,7 +35,7 @@ describe("Route Configuration (Static Analysis)", () => {
       }
     }
 
-    const duplicates = Array.from(prefixes.entries()).filter(([_, files]) => files.length > 1);
+    const duplicates = Array.from(prefixes.entries()).filter(([, files]) => files.length > 1);
     
     // We expect no duplicates. If there are, print them out clearly in the error.
     expect(duplicates).toEqual([]);
