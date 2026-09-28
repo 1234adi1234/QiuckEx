@@ -93,3 +93,33 @@ See [docs/MVP-ROADMAP.md](docs/MVP-ROADMAP.md) for the full roadmap and prioriti
 - Ask in Discussions or open an Issue if you’re stuck.
 
 Happy contributing!
+
+
+# Supabase Schema & Database Migrations Reference
+
+> **Related Documents**: 
+> - For backend service ownership and module boundaries, see [Backend Module Map](./BACKEND-MODULE-MAP.md).
+> - For contributor guidelines and PR expectations, see [Contributing Guide](../CONTRIBUTING.md).
+
+---
+
+## 1. Overview
+
+The `app/backend/supabase/migrations/` directory houses over 46 schema migrations powering QuickEx. Because the application combines traditional backend microservices with Stellar blockchain state synchronization, abuse detection, outbox messaging, and notification templating, this document serves as the definitive architecture reference for all database tables, ownership, relationships, and migration safety protocols.
+
+---
+
+## 2. Core Tables, Ownership & Purpose
+
+| Table Name | Owning Backend Module | Scope | Description & Purpose |
+| :--- | :--- | :--- | :--- |
+| `abuse_signals` | `SecurityModule` | Global | Tracks anomalous IP requests, brute-force attempts, and rate-limit violations for automated security flagging and blocking. |
+| `reconciliation_runs` | `SettlementModule` | Global | Logs automated financial and on-chain asset reconciliation runs, tracking balance discrepancies between database ledgers and Stellar network state. |
+| `notification_template_versions` | `NotificationsModule` | Global | Stores version-controlled email, push, and SMS notification templates to ensure auditability of outbound communications. |
+| `contract_specs` | `Web3Module` | Global | Caches Soroban smart contract specifications, interface schemas, and ABI definitions for backend validation. |
+| `outbox_table` | `EventBusModule` | Global | Implements the Transactional Outbox pattern, ensuring reliable asynchronous message publishing to Redis/Kafka queues. |
+| `branch_deployments` | `PreviewModule` | **Preview / Testnet Only** | Tracks ephemeral preview environment deployments, preview URLs, and associated staging database forks. |
+
+---
+
+## 3. Key Relationships & Foreign Keys (ERD Reference)
