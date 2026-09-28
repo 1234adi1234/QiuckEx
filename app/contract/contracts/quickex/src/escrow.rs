@@ -159,6 +159,27 @@ fn compute_expires_at(env: &Env, timeout_secs: u64) -> Result<u64, QuickexError>
     Ok(expires_at)
 }
 
+/// Whether the caller has already satisfied `require_auth` for an address
+/// within the current invocation frame.
+///
+/// Soroban authorizes an `(address, contract)` pair at most once per frame and
+/// fails the second attempt with `Auth(ExistingValue)` ("frame is already
+/// authorized"). A batch therefore cannot simply call `require_auth` per item:
+/// two items owned by the same address would abort. The batch entry points
+/// instead authorize every *distinct* address exactly once, up front — before
+/// any state is mutated — and then run each item with [`AuthMode::Recorded`].
+///
+/// Collecting authorization up front also means a missing signature fails the
+/// whole transaction before any token has moved, rather than part-way through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AuthMode {
+    /// The shared body must call `require_auth` for this address.
+    Required,
+    /// The enclosing entry point already recorded auth for this address in
+    /// this frame.
+    Recorded,
+}
+
 // ---------------------------------------------------------------------------
 // deposit
 // ---------------------------------------------------------------------------
@@ -209,20 +230,18 @@ fn commit_new_escrow(
     );
 }
 
-/// Deposit funds and create an escrow entry keyed by `SHA256(owner || amount_due || salt)`.
+/// Shared per-item body for every deposit variant — the single source of truth
+/// for "validate → derive commitment → write entry → pull funds → emit → hook".
 ///
-/// - Transfers `amount` from `owner` to the contract.
-/// - Sets `amount_due` to the target amount and `amount_paid` to the initial payment.
-/// - Sets status to `Pending`.
-/// - If `timeout_secs > 0`, the escrow expires `timeout_secs` seconds after creation.
-///   Pass `0` for a non-expiring escrow.
-/// - Optionally sets an `arbiter` who can resolve disputes.
+/// Both the single-item [`deposit`] and the batched `batch::batch_create` call
+/// this, so the storage write, the token transfer, the event payload, and the
+/// hook invocation can never drift apart between the two. `action` supplies the
+/// domain-separation tag for the replay-protection nonce, so a signature minted
+/// for a single deposit can never be replayed against a batch (or vice versa).
 ///
-/// # Errors
-/// - [`InvalidAmount`] – amount ≤ 0.
-/// - [`InvalidSalt`] – salt > 1024 bytes.
+/// Returns the escrow commitment on success.
 #[allow(clippy::too_many_arguments)]
-pub fn deposit(
+pub(crate) fn deposit_item(
     env: &Env,
     token: Address,
     amount: i128,
@@ -232,14 +251,18 @@ pub fn deposit(
     arbiter: Option<Address>,
     nonce_val: u64,
     valid_until: u64,
+    action: ActionType,
+    auth: AuthMode,
 ) -> Result<BytesN<32>, QuickexError> {
     if amount <= 0 {
         return Err(QuickexError::InvalidAmount);
     }
 
-    owner.require_auth();
+    if auth == AuthMode::Required {
+        owner.require_auth();
+    }
 
-    nonce::verify_and_consume(env, &owner, nonce_val, valid_until, ActionType::Deposit)?;
+    nonce::verify_and_consume(env, &owner, nonce_val, valid_until, action)?;
 
     // INV-3: validated, overflow-safe expiry computation
     let expires_at = compute_expires_at(env, timeout_secs)?;
@@ -284,6 +307,45 @@ pub fn deposit(
     commit_new_escrow(env, entry, &commitment, owner, amount);
 
     Ok(commitment)
+}
+
+/// Deposit funds and create an escrow entry keyed by `SHA256(owner || amount_due || salt)`.
+///
+/// - Transfers `amount` from `owner` to the contract.
+/// - Sets `amount_due` to the target amount and `amount_paid` to the initial payment.
+/// - Sets status to `Pending`.
+/// - If `timeout_secs > 0`, the escrow expires `timeout_secs` seconds after creation.
+///   Pass `0` for a non-expiring escrow.
+/// - Optionally sets an `arbiter` who can resolve disputes.
+///
+/// # Errors
+/// - [`InvalidAmount`] – amount ≤ 0.
+/// - [`InvalidSalt`] – salt > 1024 bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn deposit(
+    env: &Env,
+    token: Address,
+    amount: i128,
+    owner: Address,
+    salt: Bytes,
+    timeout_secs: u64,
+    arbiter: Option<Address>,
+    nonce_val: u64,
+    valid_until: u64,
+) -> Result<BytesN<32>, QuickexError> {
+    deposit_item(
+        env,
+        token,
+        amount,
+        owner,
+        salt,
+        timeout_secs,
+        arbiter,
+        nonce_val,
+        valid_until,
+        ActionType::Deposit,
+        AuthMode::Required,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -657,38 +719,34 @@ pub fn partial_payment(
 // withdraw – authorization matrix enforced (SC‑W6‑03)
 // ---------------------------------------------------------------------------
 
-/// Withdraw escrowed funds by proving commitment ownership.
+/// Shared per-item body for withdrawal — the single source of truth for
+/// "recompute commitment → validate state → mark spent → route payout → emit → hook".
 ///
-/// The caller (`to`) must authorize. The commitment is recomputed from
-/// `to`, `amount_due`, and `salt` and must match an existing pending escrow.
-/// The escrow must be fully paid (amount_paid >= amount_due).
+/// Both the single-item [`withdraw`] and the batched `batch::batch_release` call
+/// this, so the INV-1/INV-4/INV-5 checks, the fee-aware payout, the event
+/// payload, and the hook invocation can never drift apart between the two.
+/// `action` supplies the domain-separation tag for the replay-protection nonce.
 ///
-/// # Time-lock enforcement
-/// Enforces INV-1: if `expires_at > 0` and ledger timestamp >= `expires_at`,
-/// this function MUST fail. There is no admin override or bypass.
-///
-/// # Errors
-/// - [`InvalidAmount`] – amount_due ≤ 0.
-/// - [`CommitmentNotFound`] – no escrow for computed commitment.
-/// - [`EscrowExpired`] – escrow has passed its expiry.
-/// - [`AlreadySpent`] – escrow already spent or refunded.
-/// - [`InvalidCommitment`] – stored amount_due ≠ requested amount_due.
-/// - [`Overpayment`] – escrow is not fully paid yet.
-pub fn withdraw(
+/// Returns the resolved escrow commitment on success.
+pub(crate) fn withdraw_item(
     env: &Env,
     amount: i128,
     to: Address,
     salt: Bytes,
     nonce_val: u64,
     valid_until: u64,
-) -> Result<bool, QuickexError> {
+    action: ActionType,
+    auth: AuthMode,
+) -> Result<BytesN<32>, QuickexError> {
     if amount <= 0 {
         return Err(QuickexError::InvalidAmount);
     }
 
-    to.require_auth();
+    if auth == AuthMode::Required {
+        to.require_auth();
+    }
 
-    nonce::verify_and_consume(env, &to, nonce_val, valid_until, ActionType::Withdraw)?;
+    nonce::verify_and_consume(env, &to, nonce_val, valid_until, action)?;
 
     let (commitment, legacy_commitment) =
         commitment::amount_commitment_hashes(env, &to, amount, &salt)?;
@@ -758,40 +816,73 @@ pub fn withdraw(
         fee_amount,
     );
 
-    Ok(true)
+    Ok(commitment)
+}
+
+/// Withdraw escrowed funds by proving commitment ownership.
+///
+/// The caller (`to`) must authorize. The commitment is recomputed from
+/// `to`, `amount_due`, and `salt` and must match an existing pending escrow.
+/// The escrow must be fully paid (amount_paid >= amount_due).
+///
+/// # Time-lock enforcement
+/// Enforces INV-1: if `expires_at > 0` and ledger timestamp >= `expires_at`,
+/// this function MUST fail. There is no admin override or bypass.
+///
+/// # Errors
+/// - [`InvalidAmount`] – amount_due ≤ 0.
+/// - [`CommitmentNotFound`] – no escrow for computed commitment.
+/// - [`EscrowExpired`] – escrow has passed its expiry.
+/// - [`AlreadySpent`] – escrow already spent or refunded.
+/// - [`InvalidCommitment`] – stored amount_due ≠ requested amount_due.
+/// - [`Overpayment`] – escrow is not fully paid yet.
+pub fn withdraw(
+    env: &Env,
+    amount: i128,
+    to: Address,
+    salt: Bytes,
+    nonce_val: u64,
+    valid_until: u64,
+) -> Result<bool, QuickexError> {
+    withdraw_item(
+        env,
+        amount,
+        to,
+        salt,
+        nonce_val,
+        valid_until,
+        ActionType::Withdraw,
+        AuthMode::Required,
+    )
+    .map(|_| true)
 }
 
 // ---------------------------------------------------------------------------
 // refund
 // ---------------------------------------------------------------------------
 
-/// Refund an expired escrow back to its original owner.
+/// Shared per-item body for refund — the single source of truth for
+/// "load entry → validate state → mark refunded → return funds → emit → hook".
 ///
-/// - Only callable after `expires_at` has been reached (and `expires_at > 0`).
-/// - Caller must be the original depositor (`entry.owner`).
-/// - Escrow must still be `Pending`.
-///
-/// # Time-lock enforcement
-/// Enforces INV-2: both conditions must hold simultaneously —
-/// `expires_at > 0` (was set) AND `now >= expires_at` (has elapsed).
-/// A non-expiring escrow (`expires_at == 0`) can never be refunded.
-///
-/// # Errors
-/// - [`CommitmentNotFound`] – no escrow for the given commitment.
-/// - [`AlreadySpent`] – escrow already in a terminal state (INV-5).
-/// - [`InvalidDisputeState`] – escrow is disputed, funds locked (INV-4).
-/// - [`EscrowNotExpired`] – expiry not set or not yet reached (INV-2).
-/// - [`InvalidOwner`] – caller is not the original owner.
-pub fn refund(
+/// Both the single-item [`refund`] and the batched `batch::batch_refund` call
+/// this, so the INV-2/INV-4/INV-5 checks, the owner check, the transfer back to
+/// `entry.owner`, the event payload, and the hook invocation can never drift
+/// apart between the two. `action` supplies the domain-separation tag for the
+/// replay-protection nonce.
+pub(crate) fn refund_item(
     env: &Env,
     commitment: BytesN<32>,
     caller: Address,
     nonce_val: u64,
     valid_until: u64,
+    action: ActionType,
+    auth: AuthMode,
 ) -> Result<(), QuickexError> {
-    caller.require_auth();
+    if auth == AuthMode::Required {
+        caller.require_auth();
+    }
 
-    nonce::verify_and_consume(env, &caller, nonce_val, valid_until, ActionType::Refund)?;
+    nonce::verify_and_consume(env, &caller, nonce_val, valid_until, action)?;
 
     let commitment_bytes: Bytes = commitment.clone().into();
     let entry: EscrowEntry =
@@ -845,6 +936,41 @@ pub fn refund(
     );
 
     Ok(())
+}
+
+/// Refund an expired escrow back to its original owner.
+///
+/// - Only callable after `expires_at` has been reached (and `expires_at > 0`).
+/// - Caller must be the original depositor (`entry.owner`).
+/// - Escrow must still be `Pending`.
+///
+/// # Time-lock enforcement
+/// Enforces INV-2: both conditions must hold simultaneously —
+/// `expires_at > 0` (was set) AND `now >= expires_at` (has elapsed).
+/// A non-expiring escrow (`expires_at == 0`) can never be refunded.
+///
+/// # Errors
+/// - [`CommitmentNotFound`] – no escrow for the given commitment.
+/// - [`AlreadySpent`] – escrow already in a terminal state (INV-5).
+/// - [`InvalidDisputeState`] – escrow is disputed, funds locked (INV-4).
+/// - [`EscrowNotExpired`] – expiry not set or not yet reached (INV-2).
+/// - [`InvalidOwner`] – caller is not the original owner.
+pub fn refund(
+    env: &Env,
+    commitment: BytesN<32>,
+    caller: Address,
+    nonce_val: u64,
+    valid_until: u64,
+) -> Result<(), QuickexError> {
+    refund_item(
+        env,
+        commitment,
+        caller,
+        nonce_val,
+        valid_until,
+        ActionType::Refund,
+        AuthMode::Required,
+    )
 }
 
 // ---------------------------------------------------------------------------

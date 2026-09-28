@@ -722,6 +722,100 @@ impl QuickexContract {
         escrow::refund(&env, commitment, caller, nonce, valid_until)
     }
 
+    /// Create up to [`batch::MAX_BATCH_SIZE`] escrows in a single call.
+    ///
+    /// The batched counterpart of [`deposit`](QuickexContract::deposit). Every
+    /// item is executed by [`escrow::deposit_item`] — the same body that backs
+    /// the single-item flow — so each successful item performs the real token
+    /// transfer from the item's `owner`, derives the commitment and escrow id
+    /// on-chain, records the escrow, publishes `EscrowDeposited`, and invokes
+    /// the `Create` hook.
+    ///
+    /// Escrow identifiers are never supplied by the caller; each item carries
+    /// the same pre-image `deposit` uses (`token`, `amount`, `owner`, `salt`,
+    /// `timeout_secs`, `arbiter`) and the returned `commitment` is the id to
+    /// use for [`withdraw`](QuickexContract::withdraw) or
+    /// [`refund`](QuickexContract::refund).
+    ///
+    /// Replay protection is per item: each carries its own `nonce` /
+    /// `valid_until` under `ActionType::BatchCreate`, so a signature minted for
+    /// a single `deposit` can never be replayed here (and vice versa).
+    ///
+    /// ## Failure semantics
+    /// Validation failures are reported per item in the returned vector and do
+    /// not stop the rest of the batch. An authorization or token-transfer trap
+    /// reverts the whole transaction (Soroban atomicity), so no partial state
+    /// can persist.
+    ///
+    /// # Errors
+    /// * `BatchSizeExceeded` - More than `batch::MAX_BATCH_SIZE` items
+    /// * `ContractPaused` - Contract is globally paused or in emergency mode
+    /// * `OperationPaused` - The deposit feature flag is paused
+    /// * `ReentrancyDetected` - A hook is currently executing
+    pub fn batch_create(
+        env: Env,
+        items: Vec<batch::BatchCreateItem>,
+    ) -> Result<Vec<batch::BatchItemResult>, QuickexError> {
+        pause_policy::require_entry_allowed(&env, EntryPoint::BatchCreate)?;
+        hook::assert_not_reentrant(&env)?;
+        batch::batch_create(&env, items)
+    }
+
+    /// Release up to [`batch::MAX_BATCH_SIZE`] escrows in a single call.
+    ///
+    /// The batched counterpart of [`withdraw`](QuickexContract::withdraw). Every
+    /// item is executed by [`escrow::withdraw_item`], so it re-derives the
+    /// commitment from `(to, amount, salt)`, enforces the same time-lock and
+    /// terminal-state invariants, pays the recipient through the same
+    /// fee-aware payout path, publishes `EscrowWithdrawn`, and invokes the
+    /// `Settle` hook.
+    ///
+    /// Replay protection is per item, under `ActionType::BatchRelease`.
+    ///
+    /// # Errors
+    /// * `BatchSizeExceeded` - More than `batch::MAX_BATCH_SIZE` items
+    /// * `ContractPaused` - Contract is globally paused
+    /// * `OperationPaused` - The withdrawal feature flag is paused
+    /// * `ReentrancyDetected` - A hook is currently executing
+    pub fn batch_release(
+        env: Env,
+        items: Vec<batch::BatchReleaseItem>,
+    ) -> Result<Vec<batch::BatchItemResult>, QuickexError> {
+        pause_policy::require_entry_allowed(&env, EntryPoint::BatchRelease)?;
+        hook::assert_not_reentrant(&env)?;
+        batch::batch_release(&env, items)
+    }
+
+    /// Refund up to [`batch::MAX_BATCH_SIZE`] expired escrows in a single call.
+    ///
+    /// The batched counterpart of [`refund`](QuickexContract::refund). Every
+    /// item is executed by [`escrow::refund_item`], so it enforces the same
+    /// expiry and terminal-state invariants, checks that `caller` is the
+    /// recorded owner, transfers the funds back to the escrow's `owner`,
+    /// publishes `EscrowRefunded`, and invokes the `Refund` hook.
+    ///
+    /// `caller` must own every commitment in `items` — funds are always returned
+    /// to the escrow's recorded owner, never to the caller. For a
+    /// permissionless sweep across owners, use
+    /// [`finalize_expired_escrow`](QuickexContract::finalize_expired_escrow).
+    ///
+    /// Replay protection is per item, under `ActionType::BatchRefund`.
+    ///
+    /// # Errors
+    /// * `BatchSizeExceeded` - More than `batch::MAX_BATCH_SIZE` items
+    /// * `ContractPaused` - Contract is globally paused
+    /// * `OperationPaused` - The refund feature flag is paused
+    /// * `ReentrancyDetected` - A hook is currently executing
+    pub fn batch_refund(
+        env: Env,
+        caller: Address,
+        items: Vec<batch::BatchRefundItem>,
+    ) -> Result<Vec<batch::BatchItemResult>, QuickexError> {
+        pause_policy::require_entry_allowed(&env, EntryPoint::BatchRefund)?;
+        hook::assert_not_reentrant(&env)?;
+        batch::batch_refund(&env, &caller, items)
+    }
+
     /// Cleanup terminal escrow entries to reclaim storage deposits.
     ///
     /// Only escrows in `Spent` or `Refunded` status can be removed.
