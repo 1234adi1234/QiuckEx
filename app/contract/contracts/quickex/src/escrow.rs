@@ -71,6 +71,27 @@
 //!   or a non-empty `arbiters` set in multi-sig mode (`arbiter_threshold > 0`).
 //! - `resolve_dispute` can only be called by the assigned arbiter, and never
 //!   for a multi-sig escrow (INV-6).
+//!
+//! # Arbiter fee on dispute resolution
+//!
+//! A dispute resolved *for the recipient* pays a fee, and when the escrow's
+//! token has a per-asset `arbiter_bps > 0` config, part of that fee is owed to
+//! the arbiters. Resolving *for the owner* is a refund and always charges no
+//! fee, on both the single- and multi-sig paths (as does
+//! `resolve_dispute_timeout`, which only ever resolves for the owner).
+//!
+//! Who is owed differs only because the two resolution paths have different
+//! authority models:
+//!
+//! | Path | Authority model | Arbiter fee recipient |
+//! |------|-----------------|-----------------------|
+//! | [`resolve_dispute`] | Arbiter-gated; caller is necessarily the authorized arbiter | The calling arbiter, whole share |
+//! | [`resolve_dispute_multi_sig`] | Permissionless; any address may submit once quorum is met | The arbiters whose fresh votes decided the outcome, split equally |
+//!
+//! In both cases the rule is the same: the fee goes to the arbiters that
+//! decided the case. It cannot be the submitting caller in the multi-sig case —
+//! there is no arbiter behind that address, so paying it would let anyone
+//! front-run a resolution to collect the fee.
 
 use soroban_sdk::{token, Address, Bytes, BytesN, Env, Vec};
 
@@ -1317,16 +1338,33 @@ pub fn vote_for_dispute(
 // resolve_dispute_multi_sig
 // ---------------------------------------------------------------------------
 
-/// Tally fresh (non-expired) votes for each side of a dispute.
+/// Fresh votes for a dispute, bucketed by the side each arbiter voted for.
+///
+/// The voter lists mirror the counts exactly, and are drawn from the same
+/// `entry.arbiters` set the counts are tallied over — so an address outside the
+/// escrow's arbiter set can never reach the fee split any more than it can
+/// reach quorum. `recipient_voters` is the recipient-side set that
+/// [`resolve_dispute_multi_sig`] pays the arbiter fee to.
+struct FreshVoteTally {
+    for_owner: u32,
+    for_recipient: u32,
+    recipient_voters: Vec<Address>,
+}
+
+/// Tally fresh (non-expired) votes for each side of a dispute, recording which
+/// arbiters voted on the recipient side.
 fn tally_fresh_votes(
     env: &Env,
     commitment_bytes: &Bytes,
     arbiters: &Vec<Address>,
     vote_ttl_secs: u64,
-) -> (u32, u32) {
+) -> FreshVoteTally {
     let now = env.ledger().timestamp();
-    let mut votes_for_owner: u32 = 0;
-    let mut votes_for_recipient: u32 = 0;
+    let mut tally = FreshVoteTally {
+        for_owner: 0,
+        for_recipient: 0,
+        recipient_voters: Vec::new(env),
+    };
 
     for arbiter in arbiters.iter() {
         if let Some(vote) = get_dispute_vote(env, commitment_bytes, &arbiter) {
@@ -1334,14 +1372,15 @@ fn tally_fresh_votes(
                 continue; // expired; does not count toward quorum or the outcome
             }
             if vote.resolve_for_owner {
-                votes_for_owner += 1;
+                tally.for_owner += 1;
             } else {
-                votes_for_recipient += 1;
+                tally.for_recipient += 1;
+                tally.recipient_voters.push_back(arbiter);
             }
         }
     }
 
-    (votes_for_owner, votes_for_recipient)
+    tally
 }
 
 /// Resolve a disputed escrow using multi-sig arbitration.
@@ -1354,6 +1393,31 @@ fn tally_fresh_votes(
 /// - Determines the outcome based on majority among fresh votes cast.
 /// - If quorum cannot be reached before the snapshot's deadline, see
 ///   `resolve_dispute_timeout` for the fallback resolution path.
+///
+/// # Arbiter fee
+///
+/// When the escrow's token has a per-asset config with `arbiter_bps > 0`, the
+/// arbiter share of the fee is paid on the `Spent` path (i.e. when the majority
+/// voted for the recipient). The refund path charges no fee at all.
+///
+/// It is split **equally across the arbiters who cast a fresh vote for the
+/// winning (recipient) side**, drawn from `entry.arbiters` — the same set the
+/// outcome is tallied over, so an address outside the escrow's arbiter set
+/// cannot receive any of it. Each receives
+/// `floor(arbiter_portion / winner_count)`; the division remainder stays with
+/// the platform collector, so the split never overpays.
+///
+/// The resolving caller is deliberately *not* the beneficiary. Unlike
+/// [`resolve_dispute`], this function is permissionless — it takes no `caller`
+/// argument and anyone may submit it once quorum is met — so paying the
+/// submitting caller would hand the arbiter fee to an arbitrary address that
+/// could simply front-run a resolution it had no part in. The arbiters whose
+/// votes produced the outcome are the parties actually owed.
+///
+/// This mirrors the single-arbiter rule in [`resolve_dispute`], which pays
+/// `Some(&caller)` because there the caller is necessarily the authorized
+/// arbiter. Both paths are the same policy — the fee goes to the arbiters that
+/// decided the case — specialised to each resolution path's authority model.
 ///
 /// # Arguments
 /// - `commitment`: The escrow commitment hash
@@ -1398,7 +1462,7 @@ pub fn resolve_dispute_multi_sig(
     }
 
     // Tally fresh votes for each side
-    let (votes_for_owner, votes_for_recipient) = tally_fresh_votes(
+    let tally = tally_fresh_votes(
         env,
         &commitment_bytes,
         &entry.arbiters,
@@ -1406,7 +1470,7 @@ pub fn resolve_dispute_multi_sig(
     );
 
     // Determine outcome by majority
-    let resolve_for_owner = votes_for_owner >= votes_for_recipient;
+    let resolve_for_owner = tally.for_owner >= tally.for_recipient;
 
     let (final_status, recipient_address) = if resolve_for_owner {
         (EscrowStatus::Refunded, entry.owner.clone())
@@ -1419,12 +1483,15 @@ pub fn resolve_dispute_multi_sig(
     put_escrow(env, &commitment_bytes, &updated);
 
     let fee_amount = if final_status == EscrowStatus::Spent {
-        let (_payout_amount, fee) = fee_router::route_payout_price_aware(
+        // Issue #1005: the arbiter share is split across the arbiters whose
+        // fresh votes decided the outcome, not across whoever submitted this
+        // transaction. See the "Arbiter fee" section of this function's docs.
+        let (_payout_amount, fee) = fee_router::route_payout_price_aware_split(
             env,
             &entry.token,
             &recipient_address,
             entry.amount_paid,
-            None,
+            &tally.recipient_voters,
         )?;
         fee
     } else {

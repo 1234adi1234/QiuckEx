@@ -925,6 +925,14 @@ impl QuickexContract {
     /// with fresh votes. Reachable for any escrow created by
     /// [`deposit_multi_sig`](QuickexContract::deposit_multi_sig). See
     /// `resolve_dispute_timeout` for the fallback.
+    ///
+    /// Permissionless: takes no `caller`, since anyone may submit the
+    /// resolution once quorum is met. Consequently, when the escrow's token has
+    /// a per-asset `arbiter_bps > 0` config and the majority resolves *for the
+    /// recipient*, the arbiter share of the fee is split equally across the
+    /// arbiters whose fresh votes decided the outcome — not paid to whoever
+    /// submitted this call, which would be a front-running vector. See
+    /// `escrow::resolve_dispute_multi_sig` for the full policy.
     pub fn resolve_dispute_multi_sig(
         env: Env,
         commitment: BytesN<32>,
