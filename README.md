@@ -354,3 +354,102 @@ cargo test
 | STELLAR_HORIZON_URL | Horizon API |
 | STELLAR_RPC_URL | Soroban RPC endpoint |
 | REDIS_URL | Redis cache |
+
+
+# Developer Guide: Feature Flags & Contract-Write Safety Guards
+
+> **Related Document**: For operator-facing incident response instructions (such as how to flip emergency kill switches during an active live incident), please refer to the [Testnet Incident Runbook](./TESTNET-INCIDENT-RUNBOOK.md).
+
+---
+
+## 1. Overview
+
+The backend core includes a robust safety and feature gating architecture located in `app/backend/src/feature-flags/`. This directory contains critical security layers designed to protect Stellar smart contract interactions, restrict unauthorized contract writes during emergencies, and control feature rollout.
+
+Key components in this module:
+* **Feature Flag Service & Controller**: Dynamically evaluates feature toggles.
+* **`@RequiresFlag(flagName)`**: Route decorator used to gate controllers and endpoints.
+* **Contract-Write Kill Switch Constants (`contract-write-kill-switch.constants.ts`)**: Global master flags to instantly halt contract-writing operations.
+* **Emergency Entrypoint Allowlist & Registry (`emergency-entrypoint-registry.ts`, `emergency-entrypoint-allowlist.guard.ts`)**: Defines whitelisted critical functions that bypass standard restrictions during specific administrative recovery scenarios.
+* **Network Safety Guard (`network-safety.guard.ts`)**: Ensures testnet/mainnet safety boundaries are strictly enforced.
+
+---
+
+## 2. Adding a New Feature Flag End-to-End
+
+To introduce a new feature and gate access across backend and client layers, follow these steps:
+
+### Step 2.1: Register the Flag Name
+Add your new flag identifier to the feature flags configuration or database seeding file:
+
+```typescript
+// app/backend/src/feature-flags/constants/feature-flags.constants.ts
+export const FEATURE_FLAGS = {
+  STAKING_V2_ENABLED: 'staking_v2_enabled',
+  NEW_VAULT_DEPOSIT: 'new_vault_deposit', // <--- Your new flag
+} as const;
+
+
+# ==============================================================================
+# QuickEx Backend Environment Configuration Reference
+# ==============================================================================
+# This file serves as the definitive template (.env.example) reconciled against
+# app/backend/src/config/env.schema.ts. 
+#
+# Related Documentation:
+# - For core network URLs and contract IDs, see docs/RUNTIME-CONFIG-MATRIX.md.
+# - For subsystem breakdowns and environment requirements, see Section 2 below.
+# ==============================================================================
+
+# ==============================================================================
+# 1. CORE APPLICATION & SERVER
+# ==============================================================================
+NODE_ENV=development                       # Required: development | test | staging | production
+PORT=3000                                  # Optional: Port number (default: 3000)
+API_PREFIX=api/v1                          # Optional: Global route prefix
+
+# ==============================================================================
+# 2. DATABASE & REDIS CACHING
+# ==============================================================================
+DATABASE_URL=postgresql://user:pass@localhost:5432/quickex?schema=public  # Required (All envs)
+REDIS_URL=redis://localhost:6379           # Required for rate limiting & queues (All envs)
+
+# ==============================================================================
+# 3. STELLAR & WEB3 CONTRACT CONFIGURATION
+# ==============================================================================
+STELLAR_NETWORK=testnet                    # Required: testnet | mainnet
+STELLAR_RPC_URL=https://soroban-testnet.stellar.org:443  # Required
+STELLAR_ADMIN_SECRET_KEY=S...              # Required in Staging/Production for admin signing
+USDC_ASSET_ISSUER=G...                     # Required: USDC asset issuer public key on Stellar
+
+# ==============================================================================
+# 4. SECURITY, RATE LIMITING & ABUSE SIGNALS
+# ==============================================================================
+JWT_SECRET=super-secret-jwt-key            # Required (All envs)
+JWT_EXPIRES_IN=7d                          # Optional
+RATE_LIMIT_TTL=60                          # Optional (Seconds)
+RATE_LIMIT_LIMIT=100                       # Optional (Max requests per TTL)
+RATE_LIMIT_ALLOWLIST_IPS=127.0.0.1,::1     # Optional: Comma-separated trusted IPs
+ABUSE_SIGNAL_THRESHOLD=10                  # Optional: Trigger threshold for security flags
+ABUSE_SIGNAL_WINDOW_SEC=300                # Optional: Time window for abuse monitoring
+
+# ==============================================================================
+# 5. TELEMETRY & OBSERVABILITY (OTEL)
+# ==============================================================================
+OTEL_ENABLED=false                         # Optional: true | false
+OTEL_SERVICE_NAME=quickex-backend          # Required if OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317  # Required if OTEL_ENABLED=true
+
+# ==============================================================================
+# 6. QUEUES, DLQ & EXPORT SERVICES
+# ==============================================================================
+DLQ_ALERT_WEBHOOK_URL=https://hooks.slack.com/services/...  # Optional: Dead Letter Queue alerting
+EXPORT_DOWNLOAD_SECRET=secure-export-secret-key             # Required for signed report downloads
+MOBILE_MIN_SUPPORTED_VERSION=1.0.0                          # Required: Minimum client app version
+
+# ==============================================================================
+# 7. DEPRECATED / REMOVED FIELDS (Historical Reference)
+# ==============================================================================
+# STRIPE_SECRET_KEY=                       # REMOVED: Replaced by native Stellar/Soroban payments
+# PAYMENT_PROVIDER=                        # REMOVED: Legacy fiat payment switch
+# USDC_TOKEN_CONTRACT=                     # REMOVED: Replaced by dynamic registry config
