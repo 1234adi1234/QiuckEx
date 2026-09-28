@@ -23,7 +23,7 @@ use crate::{
     errors::QuickexError,
     storage::get_escrow,
     test_context::TestContext,
-    types::{EscrowStatus, Role},
+    types::{EscrowStatus, PerAssetFeeConfig, Role},
     PauseFlag,
 };
 
@@ -620,4 +620,198 @@ fn multi_sig_dispute_times_out_back_to_the_owner() {
         Some(EscrowStatus::Refunded)
     );
     assert_eq!(ctx.balance(&owner), AMOUNT);
+}
+
+// ---------------------------------------------------------------------------
+// Arbiter fee split on multi-sig resolution (issue #1005)
+// ---------------------------------------------------------------------------
+
+/// Mirrors the single-arbiter split in
+/// `fee_router_test::test_fee_router_dispute_with_optional_arbiter_split`:
+/// 10% of `amount` is fee, 20% of that fee is the arbiter pool.
+///
+/// - `amount`         = 1_000
+/// - total fee        = 100
+/// - arbiter pool     = 20
+/// - per winner       = 20 / winners, floor
+/// - collector        = 100 − (per winner × winners)
+/// - recipient net    = 900
+const FEE_AMOUNT: i128 = 1_000;
+const FEE_BPS: u32 = 1_000; // 10% of the escrow is the platform fee
+const ARBITER_BPS: u32 = 2_000; // 20% of the fee is the arbiter pool
+
+/// Configure a collector plus a per-asset fee with a live `arbiter_bps` split
+/// for the test context's token.
+fn configure_arbiter_fee(ctx: &TestContext, collector: &Address) {
+    ctx.client.set_platform_wallet(&ctx.admin, collector);
+    ctx.client.set_per_asset_fee(
+        &ctx.admin,
+        &ctx.token,
+        &PerAssetFeeConfig {
+            fee_bps: FEE_BPS,
+            arbiter_bps: ARBITER_BPS,
+        },
+    );
+}
+
+#[test]
+fn multi_sig_dispute_pays_arbiter_fee_split_to_winning_voters() {
+    let ctx = TestContext::with_admin();
+    let owner = ctx.alice.clone();
+    let recipient = ctx.bob.clone();
+    let collector = Address::generate(&ctx.env);
+    let arbiters = [
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+    ];
+    configure_arbiter_fee(&ctx, &collector);
+
+    let commitment = ctx.deposit_with_arbiters(&owner, FEE_AMOUNT, SALT, 0, &arbiters, 2);
+
+    ctx.client.dispute(&commitment);
+    // Default quorum is 2, so two of the three votes for the recipient settle it.
+    for arbiter in arbiters.iter().take(2) {
+        ctx.client
+            .vote_for_dispute(arbiter, &commitment, &false, &0, &NEVER);
+    }
+    ctx.client
+        .resolve_dispute_multi_sig(&commitment, &recipient);
+
+    assert_escrow_spent(&ctx.client, &commitment);
+
+    // The arbiter pool (20) is split equally across the two arbiters whose
+    // fresh votes decided the outcome — 10 each, not 0 as before the fix and
+    // not 20 to a single arbitrary winner.
+    assert_eq!(ctx.balance(&arbiters[0]), 10);
+    assert_eq!(ctx.balance(&arbiters[1]), 10);
+    // The third arbiter did not vote for the winning side, so it is not owed.
+    assert_eq!(ctx.balance(&arbiters[2]), 0);
+
+    // Recipient 900, collector 100 − 20 = 80.
+    assert_eq!(ctx.balance(&recipient), 900);
+    assert_eq!(ctx.balance(&collector), 80);
+
+    // Nothing is stranded or minted: the three destinations sum to the gross
+    // amount and the contract keeps none of it.
+    let paid = ctx.balance(&recipient)
+        + ctx.balance(&collector)
+        + ctx.balance(&arbiters[0])
+        + ctx.balance(&arbiters[1])
+        + ctx.balance(&arbiters[2]);
+    assert_eq!(paid, FEE_AMOUNT);
+    assert_eq!(ctx.balance(&ctx.client.address), 0);
+}
+
+#[test]
+fn multi_sig_arbiter_fee_split_leaves_the_rounding_remainder_with_the_platform() {
+    let ctx = TestContext::with_admin();
+    let owner = ctx.alice.clone();
+    let recipient = ctx.bob.clone();
+    let collector = Address::generate(&ctx.env);
+    let arbiters = [
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+    ];
+    configure_arbiter_fee(&ctx, &collector);
+
+    let commitment = ctx.deposit_with_arbiters(&owner, FEE_AMOUNT, SALT, 0, &arbiters, 2);
+
+    // All three vote for the recipient, so the pool of 20 divides 3 ways:
+    // 6 each with 2 left over. The remainder stays with the platform rather
+    // than being rounded up onto the arbiters.
+    ctx.client.dispute(&commitment);
+    for arbiter in arbiters.iter() {
+        ctx.client
+            .vote_for_dispute(arbiter, &commitment, &false, &0, &NEVER);
+    }
+    ctx.client
+        .resolve_dispute_multi_sig(&commitment, &recipient);
+
+    for arbiter in arbiters.iter() {
+        assert_eq!(ctx.balance(arbiter), 6);
+    }
+    assert_eq!(ctx.balance(&collector), 100 - 18);
+    assert_eq!(ctx.balance(&recipient), 900);
+
+    let paid = ctx.balance(&recipient)
+        + ctx.balance(&collector)
+        + arbiters.iter().map(|a| ctx.balance(a)).sum::<i128>();
+    assert_eq!(paid, FEE_AMOUNT);
+}
+
+#[test]
+fn multi_sig_arbiter_fee_excludes_arbiters_that_voted_for_the_owner() {
+    let ctx = TestContext::with_admin();
+    let owner = ctx.alice.clone();
+    let recipient = ctx.bob.clone();
+    let collector = Address::generate(&ctx.env);
+    let arbiters = [
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+    ];
+    configure_arbiter_fee(&ctx, &collector);
+
+    let commitment = ctx.deposit_with_arbiters(&owner, FEE_AMOUNT, SALT, 0, &arbiters, 2);
+
+    // 2-1 for the recipient, so it resolves to Spent. The split must follow the
+    // votes that won, not merely the escrow's whole arbiter set.
+    ctx.client.dispute(&commitment);
+    ctx.client
+        .vote_for_dispute(&arbiters[0], &commitment, &false, &0, &NEVER);
+    ctx.client
+        .vote_for_dispute(&arbiters[1], &commitment, &false, &0, &NEVER);
+    ctx.client
+        .vote_for_dispute(&arbiters[2], &commitment, &true, &0, &NEVER);
+    ctx.client
+        .resolve_dispute_multi_sig(&commitment, &recipient);
+
+    assert_escrow_spent(&ctx.client, &commitment);
+    assert_eq!(ctx.balance(&arbiters[0]), 10);
+    assert_eq!(ctx.balance(&arbiters[1]), 10);
+    // Voted for the losing side, and never voted at all: neither is owed.
+    assert_eq!(ctx.balance(&arbiters[2]), 0);
+    assert_eq!(ctx.balance(&arbiters[3]), 0);
+    assert_eq!(ctx.balance(&collector), 80);
+    assert_eq!(ctx.balance(&recipient), 900);
+}
+
+#[test]
+fn multi_sig_owner_refund_charges_no_arbiter_fee() {
+    let ctx = TestContext::with_admin();
+    let owner = ctx.alice.clone();
+    let recipient = ctx.bob.clone();
+    let collector = Address::generate(&ctx.env);
+    let arbiters = [
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+        Address::generate(&ctx.env),
+    ];
+    // A live arbiter_bps that a refund must still ignore: resolving for the
+    // owner is a refund, so no fee of any kind is charged.
+    configure_arbiter_fee(&ctx, &collector);
+
+    let commitment = ctx.deposit_with_arbiters(&owner, FEE_AMOUNT, SALT, 0, &arbiters, 2);
+
+    ctx.client.dispute(&commitment);
+    for arbiter in arbiters.iter().take(2) {
+        ctx.client
+            .vote_for_dispute(arbiter, &commitment, &true, &0, &NEVER);
+    }
+    ctx.client
+        .resolve_dispute_multi_sig(&commitment, &recipient);
+
+    assert_eq!(
+        ctx.client.get_commitment_state(&commitment),
+        Some(EscrowStatus::Refunded)
+    );
+    assert_eq!(ctx.balance(&owner), FEE_AMOUNT);
+    assert_eq!(ctx.balance(&recipient), 0);
+    for arbiter in arbiters.iter() {
+        assert_eq!(ctx.balance(arbiter), 0);
+    }
+    assert_eq!(ctx.balance(&collector), 0);
 }
