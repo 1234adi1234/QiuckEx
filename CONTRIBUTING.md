@@ -123,3 +123,9 @@ The `app/backend/supabase/migrations/` directory houses over 46 schema migration
 ---
 
 ## 3. Key Relationships & Foreign Keys (ERD Reference)
+
+await this.notificationService.dispatch({
+  type: NOTIFICATION_TYPES.STAKING_REWARD_CLAIMED,
+  recipientId: user.id,
+  payload: { amount: '150', tokenSymbol: 'USDC' },
+});
