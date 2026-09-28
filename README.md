@@ -354,3 +354,37 @@ cargo test
 | STELLAR_HORIZON_URL | Horizon API |
 | STELLAR_RPC_URL | Soroban RPC endpoint |
 | REDIS_URL | Redis cache |
+
+
+# Developer Guide: Feature Flags & Contract-Write Safety Guards
+
+> **Related Document**: For operator-facing incident response instructions (such as how to flip emergency kill switches during an active live incident), please refer to the [Testnet Incident Runbook](./TESTNET-INCIDENT-RUNBOOK.md).
+
+---
+
+## 1. Overview
+
+The backend core includes a robust safety and feature gating architecture located in `app/backend/src/feature-flags/`. This directory contains critical security layers designed to protect Stellar smart contract interactions, restrict unauthorized contract writes during emergencies, and control feature rollout.
+
+Key components in this module:
+* **Feature Flag Service & Controller**: Dynamically evaluates feature toggles.
+* **`@RequiresFlag(flagName)`**: Route decorator used to gate controllers and endpoints.
+* **Contract-Write Kill Switch Constants (`contract-write-kill-switch.constants.ts`)**: Global master flags to instantly halt contract-writing operations.
+* **Emergency Entrypoint Allowlist & Registry (`emergency-entrypoint-registry.ts`, `emergency-entrypoint-allowlist.guard.ts`)**: Defines whitelisted critical functions that bypass standard restrictions during specific administrative recovery scenarios.
+* **Network Safety Guard (`network-safety.guard.ts`)**: Ensures testnet/mainnet safety boundaries are strictly enforced.
+
+---
+
+## 2. Adding a New Feature Flag End-to-End
+
+To introduce a new feature and gate access across backend and client layers, follow these steps:
+
+### Step 2.1: Register the Flag Name
+Add your new flag identifier to the feature flags configuration or database seeding file:
+
+```typescript
+// app/backend/src/feature-flags/constants/feature-flags.constants.ts
+export const FEATURE_FLAGS = {
+  STAKING_V2_ENABLED: 'staking_v2_enabled',
+  NEW_VAULT_DEPOSIT: 'new_vault_deposit', // <--- Your new flag
+} as const;
