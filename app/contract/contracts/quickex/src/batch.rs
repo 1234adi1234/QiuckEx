@@ -51,12 +51,7 @@
 
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Vec};
 
-use crate::{
-    escrow,
-    escrow::AuthMode,
-    errors::QuickexError,
-    nonce::ActionType,
-};
+use crate::{errors::QuickexError, escrow, escrow::AuthMode, nonce::ActionType};
 
 /// Maximum number of items allowed in a single batch call.
 ///

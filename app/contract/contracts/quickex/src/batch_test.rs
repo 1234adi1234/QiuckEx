@@ -19,8 +19,8 @@
 
 use crate::{
     assert_helpers::{
-        assert_escrow_not_found, assert_escrow_pending, assert_escrow_refunded, assert_escrow_spent,
-        assert_qx_err,
+        assert_escrow_not_found, assert_escrow_pending, assert_escrow_refunded,
+        assert_escrow_spent, assert_qx_err,
     },
     batch::{BatchCreateItem, BatchItemResult, BatchRefundItem, BatchReleaseItem, MAX_BATCH_SIZE},
     errors::QuickexError,
@@ -111,7 +111,10 @@ fn assert_success(result: &BatchItemResult, index: u32) {
         "item {index} should have succeeded, but failed with error_code {}",
         result.error_code
     );
-    assert_eq!(result.error_code, 0, "successful item must carry error_code 0");
+    assert_eq!(
+        result.error_code, 0,
+        "successful item must carry error_code 0"
+    );
     assert_eq!(result.index, index, "result must be in submission order");
 }
 
@@ -174,7 +177,11 @@ fn batch_create_transfers_funds_into_the_contract() {
     let total = AMOUNT * count as i128;
 
     ctx.mint(&ctx.alice, total);
-    assert_eq!(balance(&ctx, &ctx.alice), total, "owner starts fully funded");
+    assert_eq!(
+        balance(&ctx, &ctx.alice),
+        total,
+        "owner starts fully funded"
+    );
     assert_eq!(balance(&ctx, &ctx.client.address), 0);
 
     let commitments = fund(&ctx, &ctx.alice, count, 0, AMOUNT, 0);
@@ -202,9 +209,12 @@ fn batch_create_transfers_funds_into_the_contract() {
         // The id is the commitment over (owner, amount, salt) — not a
         // caller-chosen key.
         assert_eq!(commitment, ctx.commitment(&ctx.alice, AMOUNT, &[offset]));
-        assert!(ctx
-            .client
-            .verify_amount_commitment(&commitment, &ctx.alice, &AMOUNT, &salt_for(&ctx, offset)));
+        assert!(ctx.client.verify_amount_commitment(
+            &commitment,
+            &ctx.alice,
+            &AMOUNT,
+            &salt_for(&ctx, offset)
+        ));
     }
 }
 
@@ -358,7 +368,10 @@ fn batch_create_over_limit_is_rejected_with_no_side_effects() {
     assert_eq!(balance(&ctx, &ctx.client.address), 0);
 
     for tag in 0..=MAX_BATCH_SIZE {
-        assert_escrow_not_found(&ctx.client, &ctx.commitment(&ctx.alice, AMOUNT, &[tag as u8]));
+        assert_escrow_not_found(
+            &ctx.client,
+            &ctx.commitment(&ctx.alice, AMOUNT, &[tag as u8]),
+        );
     }
 }
 
@@ -453,10 +466,7 @@ fn batch_create_duplicate_payload_is_idempotent() {
     // And the escrow is still withdrawable exactly once.
     let mut releases: Vec<BatchReleaseItem> = Vec::new(&ctx.env);
     releases.push_back(release_item(&ctx, 7, &ctx.alice, AMOUNT));
-    assert_success(
-        &ctx.client.batch_release(&releases).get(0).unwrap(),
-        0,
-    );
+    assert_success(&ctx.client.batch_release(&releases).get(0).unwrap(), 0);
     assert_eq!(
         balance(&ctx, &ctx.alice),
         AMOUNT * 2,
@@ -485,16 +495,8 @@ fn batch_create_rejects_replayed_nonce() {
 
     // Replay the exact same vector.
     let replay = do_create(&ctx, items);
-    assert_failure(
-        &replay.get(0).unwrap(),
-        0,
-        QuickexError::NonceAlreadyUsed,
-    );
-    assert_failure(
-        &replay.get(1).unwrap(),
-        1,
-        QuickexError::NonceAlreadyUsed,
-    );
+    assert_failure(&replay.get(0).unwrap(), 0, QuickexError::NonceAlreadyUsed);
+    assert_failure(&replay.get(1).unwrap(), 1, QuickexError::NonceAlreadyUsed);
     assert_eq!(
         balance(&ctx, &ctx.client.address),
         AMOUNT * 2,
@@ -595,11 +597,7 @@ fn batch_create_rejects_expired_valid_until() {
     });
 
     let results = do_create(&ctx, items);
-    assert_failure(
-        &results.get(0).unwrap(),
-        0,
-        QuickexError::SignatureExpired,
-    );
+    assert_failure(&results.get(0).unwrap(), 0, QuickexError::SignatureExpired);
     assert_eq!(balance(&ctx, &ctx.client.address), 0);
 }
 
@@ -623,7 +621,11 @@ fn batch_release_rejects_expired_escrow() {
     let results = ctx.client.batch_release(&releases);
 
     assert_failure(&results.get(0).unwrap(), 0, QuickexError::EscrowExpired);
-    assert_eq!(balance(&ctx, &ctx.alice), 0, "no payout on an expired escrow");
+    assert_eq!(
+        balance(&ctx, &ctx.alice),
+        0,
+        "no payout on an expired escrow"
+    );
     assert_eq!(balance(&ctx, &ctx.client.address), AMOUNT);
     assert_escrow_pending(&ctx.client, &commitments.get(0).unwrap());
 }
@@ -782,11 +784,7 @@ fn batch_refund_rejects_escrow_that_has_not_expired() {
     refunds.push_back(refund_item(&commitments.get(0).unwrap()));
     let results = ctx.client.batch_refund(&ctx.alice, &refunds);
 
-    assert_failure(
-        &results.get(0).unwrap(),
-        0,
-        QuickexError::EscrowNotExpired,
-    );
+    assert_failure(&results.get(0).unwrap(), 0, QuickexError::EscrowNotExpired);
     assert_eq!(balance(&ctx, &ctx.alice), 0, "no refund before expiry");
     assert_eq!(balance(&ctx, &ctx.client.address), AMOUNT);
 }
@@ -827,7 +825,10 @@ fn batch_refund_rejects_already_terminal_escrow() {
     let mut refunds: Vec<BatchRefundItem> = Vec::new(&ctx.env);
     refunds.push_back(refund_item(&commitment));
     assert_success(
-        &ctx.client.batch_refund(&ctx.alice, &refunds).get(0).unwrap(),
+        &ctx.client
+            .batch_refund(&ctx.alice, &refunds)
+            .get(0)
+            .unwrap(),
         0,
     );
     assert_eq!(balance(&ctx, &ctx.alice), AMOUNT);
@@ -881,7 +882,11 @@ fn batch_refund_reports_per_item_failures() {
     let results = ctx.client.batch_refund(&ctx.alice, &refunds);
     assert_success(&results.get(0).unwrap(), 0);
     assert_failure(&results.get(1).unwrap(), 1, QuickexError::EscrowNotExpired);
-    assert_failure(&results.get(2).unwrap(), 2, QuickexError::CommitmentNotFound);
+    assert_failure(
+        &results.get(2).unwrap(),
+        2,
+        QuickexError::CommitmentNotFound,
+    );
 
     assert_eq!(
         balance(&ctx, &ctx.alice),
@@ -1032,7 +1037,9 @@ fn emergency_mode_blocks_create_but_allows_release_and_refund() {
     ctx.mint(&ctx.alice, AMOUNT * 2);
 
     // Fund two escrows before the freeze: one to release, one to let expire.
-    let releasable = fund(&ctx, &ctx.alice, 1, 0, AMOUNT, TIMEOUT).get(0).unwrap();
+    let releasable = fund(&ctx, &ctx.alice, 1, 0, AMOUNT, TIMEOUT)
+        .get(0)
+        .unwrap();
     fund(&ctx, &ctx.alice, 1, 1, AMOUNT, TIMEOUT);
     assert_eq!(balance(&ctx, &ctx.client.address), AMOUNT * 2);
 
@@ -1069,7 +1076,13 @@ fn emergency_mode_blocks_create_but_allows_release_and_refund() {
     ctx.advance_time(TIMEOUT);
     let mut refunds: Vec<BatchRefundItem> = Vec::new(&ctx.env);
     refunds.push_back(refund_item(&ctx.commitment(&ctx.alice, AMOUNT, &[1])));
-    assert_success(&ctx.client.batch_refund(&ctx.alice, &refunds).get(0).unwrap(), 0);
+    assert_success(
+        &ctx.client
+            .batch_refund(&ctx.alice, &refunds)
+            .get(0)
+            .unwrap(),
+        0,
+    );
     assert_eq!(balance(&ctx, &ctx.client.address), 0);
     assert_eq!(balance(&ctx, &ctx.alice), AMOUNT * 2);
 }
