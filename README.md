@@ -453,3 +453,25 @@ MOBILE_MIN_SUPPORTED_VERSION=1.0.0                          # Required: Minimum 
 # STRIPE_SECRET_KEY=                       # REMOVED: Replaced by native Stellar/Soroban payments
 # PAYMENT_PROVIDER=                        # REMOVED: Legacy fiat payment switch
 # USDC_TOKEN_CONTRACT=                     # REMOVED: Replaced by dynamic registry config
+
+# Mobile Deep Link Routing & Debug Guide
+
+> **Related Documents**:
+> - For OS-level verification files, Apple App Site Association (`apple-app-site-association`), and Android Digital Asset Links (`assetlinks.json`), please refer to the root [Universal Links Implementation Summary](../UNIVERSAL_LINKS_IMPLEMENTATION_SUMMARY.md) and [Universal Links Testing Guide](../UNIVERSAL_LINKS_TESTING_GUIDE.md).
+> - This document focuses exclusively on **in-app routing, URL parsing, target screens, and developer debugging**.
+
+---
+
+## 1. Overview & Supported Link Formats
+
+The QuickEx mobile application (`app/mobile/`) supports both custom URI schemes for local testing and secure Universal/App Links for production routing.
+
+### Supported Schemes & Domains
+* **Custom URI Scheme**: `quickex://` (e.g., `quickex://payment-confirmation?txId=123&amount=50`)
+* **Universal Links / App Links**: `https://app.quickex.io/` or preview domain variants configured in `app/mobile/app.json` under `expo.ios.associatedDomains` and `expo.android.intentFilters`.
+
+---
+
+## 2. In-App Routing & Parsing (`app/_layout.tsx`)
+
+Incoming deep links are intercepted and parsed within `app/mobile/app/_layout.tsx` using Expo Router's deep linking listener hooks.
