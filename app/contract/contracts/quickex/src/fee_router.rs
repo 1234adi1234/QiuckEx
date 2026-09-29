@@ -26,7 +26,7 @@
 //! The caller of the routing entry point decides, and the two paths differ
 //! because their authority models differ:
 //!
-//! - **Single-arbiter** ([`route_payout`], [`route_payout_price_aware`]) takes
+//! - **Single-arbiter** ([`route_payout_price_aware`]) takes
 //!   one `Option<&Address>`: the arbiter who authorized the resolution.
 //! - **Multi-arbiter** ([`route_payout_price_aware_split`]) takes a *set* and
 //!   divides the arbiter portion equally among them. `resolve_dispute_multi_sig`
@@ -190,53 +190,9 @@ fn single_arbiter_set(env: &Env, arbiter: Option<&Address>) -> Vec<Address> {
     set
 }
 
-/// Route a settled payout, applying per-asset fees, arbiter splits, and
-/// collector rotation in a single atomic operation.
-///
-/// Performs all token transfers from `env.current_contract_address()`:
-/// - Net payout → `recipient`
-/// - Arbiter portion of fee → `arbiter` (if `arbiter_bps > 0` and `arbiter` provided)
-/// - Platform portion of fee → active collector (if set)
-///
-/// Returns `(net_payout, total_fee)`.
-///
-/// # Arguments
-/// * `token`     — Token contract address (XLM or SAC)
-/// * `recipient` — Beneficiary of the net payout
-/// * `amount`    — Gross amount to distribute (must be > 0)
-/// * `arbiter`   — Optional arbiter address for fee split
-///
-/// # Safety
-/// If `amount <= 0`, returns `(amount, 0)` without any transfers.
-#[allow(dead_code)]
-pub fn route_payout(
-    env: &Env,
-    token: &Address,
-    recipient: &Address,
-    amount: i128,
-    arbiter: Option<&Address>,
-) -> (i128, i128) {
-    if amount <= 0 {
-        return (amount, 0);
-    }
-
-    // Resolve total fee using per-asset → oracle → global priority.
-    let total_fee = fee::calculate_fee_for_token(env, token, amount);
-    let net_payout = distribute_payout(
-        env,
-        token,
-        recipient,
-        amount,
-        total_fee,
-        &single_arbiter_set(env, arbiter),
-    );
-
-    (net_payout, total_fee)
-}
-
 /// Price-aware payout routing with explicit oracle price validation.
 ///
-/// Same payout logic as [`route_payout`] but uses
+/// Uses
 /// [`calculate_fee_for_token_price_aware`](crate::fee::calculate_fee_for_token_price_aware)
 /// which REJECTS the transaction when an oracle fee config exists but no fresh
 /// price is available (rather than silently falling back to static bps).
